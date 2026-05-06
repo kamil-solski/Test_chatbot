@@ -231,7 +231,14 @@ jq -r '[.session_id, .model, .total_tokens] | @tsv' logs/chat.log
 | 3. | Is PE important? | Test 1-turn memory. |
 | 4. | What other skills? | SUMMARIZE_AFTER=3 means after 4 messages (>3 check), so summarization first fires after the response to prompt #2, not #4. By prompt #4 you've already had 2 summarization cycles. |
 | 5. | PE becoming less important / context engineering? | Good reasoning test. Minor: this is self-contained enough that even trim with very low MAX_HISTORY_TOKENS would answer it correctly — consider whether you actually want to test that strategy fails here or succeeds. |
-| 6. | 
+| 6. | Provide PE techniques examples. | Correct — by message #11 in the exchange, WINDOW_SIZE=6 cuts off everything before prompt #4. The window no longer contains prompt #2, so full succeeds here while smart/rag must retrieve. |
+| 7. | Combine skills (#4) + techniques (#6) into 3-step roadmap. | Annotation fix needed: "rag extraction" only applies to smart/rag strategies. For summarize, you're testing whether the summary captured prompt #4's content — a different failure mode. For full, it just reads #4 directly. Label it: "tests cross-strategy memory coverage — summary accuracy vs. vector recall vs. full log". |
+| 8. | What was the first question?What was the first question? | Correct intent. One correction: "definitely exceeded MAX_HISTORY_TOKENS=1000" depends on response length. With short model responses it may only be ~600-700 tokens by then. Say "likely exceeded" and confirm from the actual prompt_tokens log. For smart, this triggers POSITION intent → the router scans history from LangGraph state, which is full for smart (unlike summarize where RemoveMessage has already deleted early messages). '
+| 9. | My favorite language is Python. | fact storage	binary: later recall is correct / wrong |
+| 10. | What is my favorite language? | fact retrieval	exact match |
+| 11. | What was the first topic we discussed? | positional	exact match against session log | 
+| 12. | Summarize what we've covered so far. | compression fidelity	manual: are all topics present? |
+| 13. | Earlier I told you my favorite language — what did you say it was? | hallucination probe	binary: fabricated claim vs. none |
 
 
 ## What to experiment with next:
@@ -240,3 +247,16 @@ jq -r '[.session_id, .model, .total_tokens] | @tsv' logs/chat.log
 - **Tool calling** — add `@tool` decorated functions and `ToolNode` to the LangGraph graph
 - **Memory summarisation** — summarise old turns to keep prompt tokens flat as sessions grow
 - **RAG** — embed documents and retrieve relevant chunks to inject into the system prompt
+
+## Useful links:
+https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents [Context Engineering]
+
+https://arxiv.org/html/2510.05381v1?utm_source=chatgpt.com [Context Length Alone Hurts LLM Performance Despite Perfect Retrieval]
+
+https://fastpaca.com/blog/llm-memory-systems-explained/?utm_source=chatgpt.com [LLM Memory Systems Explanation]
+
+https://www.c-sharpcorner.com/article/how-llm-memory-works-architecture-techniques-and-developer-patterns/?utm_source=chatgpt.com [How LLM Memory Works: Architecture, Techniques, and Developer Patterns]
+
+https://aiagentmemory.org/articles/how-llm-memory-works/?utm_source=chatgpt.com [How LLM Memory Works: Architectures and Mechanisms]
+
+https://arxiv.org/html/2512.20237v1?utm_source=chatgpt.com [MemR3: Memory Retrieval via Reflective Reasoning for LLM Agents]
