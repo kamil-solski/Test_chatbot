@@ -1,0 +1,38 @@
+# Agentic Workflows vs. Agentic Systems: A Comparative Analysis
+
+The evolution of AI has moved from simple "zero-shot" prompting to complex, multi-step processes. To understand this shift, it is essential to distinguish between Agentic Workflows and Agentic Systems.
+
+## 1. Agentic Workflows: Structured Iteration
+An agentic workflow is a design pattern where an AI follows a predefined, hard-coded sequence of steps to complete a task. Rather than asking an LLM to generate an answer in one go, the developer orchestrates a loop of refinement.
+
+*   Mechanism: The developer defines the logic (e.g., Step 1: Draft -> Step 2: Critique -> Step 3: Revise).
+*   Autonomy: Low. The AI is autonomous within each step, but the "path" is set by the human programmer.
+*   Predictability: High. Because the workflow follows a specific graph or chain, it is easier to debug and measure for performance.
+*   Common Patterns:
+    - Reflection: The model reviews its own work to find errors.
+    - Planning: The model lists steps before executing them (but the system enforces the list).
+    - Tool Use: The model is prompted to use a specific tool at a specific stage.
+
+## 2. Agentic Systems: Goal-Driven Autonomy
+Agentic systems represent a higher level of complexity where the AI is given a high-level objective and determines its own path to reach it. It acts as an "orchestrator" rather than just a participant in a script.
+
+*   Mechanism: The system uses a "reasoning loop" (like ReAct or Plan-and-Execute) to decide which actions to take dynamically.
+*   Autonomy: High. The system decides which tools to call, which sub-tasks to create, and when the goal has been met.
+*   Predictability: Variable. Different runs for the same goal may result in different paths, making testing and "guardrailing" more challenging.
+*   Common Characteristics:
+    - Dynamic Decomposition: Breaking a large goal into smaller, unplanned sub-goals.
+    - Multi-Agent Collaboration: Multiple specialized agents (e.g., a "Coder" and a "Reviewer") communicating and delegating to one another.
+    - Self-Correction: If a chosen path fails, the system autonomously pivots to a new strategy.
+
+## 3. Key Differences at a Glance
+
+
+| Feature           | Agentic Workflow               | Agentic System                  |
+|-------------------|--------------------------------|---------------------------------|
+| Logic Driver      | Deterministic code/flows       | Probabilistic LLM reasoning     |
+| Control           | Developer-led                  | Goal-led                        |
+| Scalability       | Limited to defined paths       | Scales to open-ended problems   |
+| Best Use Case     | Content creation, ETL, Audits  | Research, Troubleshooting, Ops  |
+
+## Summary
+Workflows provide the reliability needed for enterprise applications where process compliance is key. Systems provide the flexibility needed for "open-world" problems where the solution path cannot be predicted in advance.

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Test Chatbot</title>
+  <link rel="stylesheet" href="../static/css/styles.css">
+</head>
+<body>
+
+  <header>
+    <h1>🤖 Test Chatbot</h1>
+    <select id="model-select">
+      <option value="gpt-4o-mini">GPT-4o mini</option>
+      <option value="gpt-4o">GPT-4o</option>
+      <option value="gpt-4-turbo">GPT-4 Turbo</option>
+      <option value="claude-haiku-4-5">Claude 4.5 Haiku</option>
+    </select>
+  </header>
+
+  <div id="doc-bar"></div>
+
+  <div id="chat-window"></div>
+
+  <div id="usage-bar"></div>
+
+  <div id="input-area">
+    <textarea
+      id="message-input"
+      placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
+      rows="1"
+    ></textarea>
+    <input type="file" id="file-input" accept=".txt" hidden />
+    <button id="upload-btn" title="Upload .txt document">📎</button>
+    <button id="send-btn">Send</button>
+  </div>
+
+  <script src="../src/script.js"></script>
+</body>
+</html>

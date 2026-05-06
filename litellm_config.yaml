@@ -1,0 +1,23 @@
+model_list:
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: gpt-4-turbo
+    litellm_params:
+      model: openai/gpt-4-turbo
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5-20251001
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+litellm_settings:
+  drop_params: true   # silently ignore unsupported params per model
