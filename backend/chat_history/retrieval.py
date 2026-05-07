@@ -1,18 +1,22 @@
 """Orchestrates retrieval based on a routing decision.
 
 Maps each Intent to one of the four retrieval patterns:
-  - CONTINUATION → sliding window only
-  - POSITION     → filter-only on raw log (no embeddings)
-  - TOPIC_RECALL → filter→vector (topic-bounded similarity)
-  - SEMANTIC_RECALL → pure vector
-  - NORMAL       → window only (summary handles drift via separate node)
+  - CONTINUATION → sliding window + chunk summaries
+  - POSITION     → filter-only on raw log (no embeddings) + chunk summaries
+  - TOPIC_RECALL → filter→vector (topic-bounded similarity) + chunk summaries
+  - SEMANTIC_RECALL → pure vector + chunk summaries
+  - NORMAL       → sliding window + chunk summaries
 """
 import re
+from typing import TYPE_CHECKING
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from .router import Intent, RoutingDecision
 from .store import ChatHistoryStore
+
+if TYPE_CHECKING:
+    from .summarizer import ChunkSummarizer
 
 
 async def retrieve_for_query(
@@ -23,17 +27,24 @@ async def retrieve_for_query(
     query: str,
     rag_k: int = 4,
     window_size: int = 6,
+    summarizer: "ChunkSummarizer | None" = None,
 ) -> tuple[list[BaseMessage], str]:
     """Returns (messages_for_llm, extra_system_context)."""
     current = messages[-1]
     history = messages[:-1]
 
-    # Always index messages so future turns can retrieve them
     await store.index_messages(session_id, history)
+
+    if summarizer:
+        await summarizer.update(session_id, history, window_size)
+    chunk_context = summarizer.get_context(session_id) if summarizer else ""
 
     if decision.intent == Intent.POSITION:
         position_info = _resolve_position(query, history)
-        return [current], f"Relevant raw log entry:\n{position_info}"
+        extra = f"Relevant raw log entry:\n{position_info}"
+        if chunk_context:
+            extra = chunk_context + "\n\n" + extra
+        return [current], extra
 
     if decision.use_vector:
         docs = store.retrieve(
@@ -44,10 +55,10 @@ async def retrieve_for_query(
             role_map.get(d.metadata.get("role"), HumanMessage)(content=d.page_content)
             for d in docs
         ]
-        return retrieved + [current], ""
+        return retrieved + [current], chunk_context
 
-    # CONTINUATION / NORMAL: sliding window only
-    return history[-window_size:] + [current], ""
+    # CONTINUATION / NORMAL: sliding window + chunk summaries
+    return history[-window_size:] + [current], chunk_context
 
 
 def _resolve_position(query: str, history: list[BaseMessage]) -> str:
@@ -57,10 +68,19 @@ def _resolve_position(query: str, history: list[BaseMessage]) -> str:
     if not user_messages:
         return "(no prior user prompts in this session)"
 
+    topic_query = any(w in lower for w in ("topic", "subject", "thing", "discussion"))
+
     if any(w in lower for w in ("first", "initial", "original", "starting")):
+        if topic_query:
+            # Return first two exchanges so the model can infer the actual topic
+            excerpt = _format_exchanges(history[:4])
+            return f"Start of conversation:\n{excerpt}"
         return f"User's first prompt: {user_messages[0].content}"
 
     if any(w in lower for w in ("last", "previous", "prior")):
+        if topic_query:
+            excerpt = _format_exchanges(history[-4:])
+            return f"Most recent conversation:\n{excerpt}"
         return f"User's most recent prior prompt: {user_messages[-1].content}"
 
     match = re.search(r"\b(\d+)(st|nd|rd|th)?\s+(prompt|message|question)\b", lower)
@@ -71,3 +91,13 @@ def _resolve_position(query: str, history: list[BaseMessage]) -> str:
         return f"(prompt #{n} not found — only {len(user_messages)} prompts so far)"
 
     return f"(could not resolve position; total prior prompts: {len(user_messages)})"
+
+
+def _format_exchanges(messages: list[BaseMessage]) -> str:
+    lines = []
+    for m in messages:
+        if not isinstance(m.content, str):
+            continue
+        role = "User" if isinstance(m, HumanMessage) else "Assistant"
+        lines.append(f"{role}: {m.content[:300]}")
+    return "\n".join(lines)

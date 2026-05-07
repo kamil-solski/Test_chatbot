@@ -8,6 +8,8 @@ _DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 CHAT_LOG = Path(os.getenv("CHAT_LOG", "logs/chat.log"))
 DEBUG_LOG = Path(os.getenv("DEBUG_LOG", "logs/debug.log"))
 
+_session_tokens: dict[str, int] = {}
+
 
 def _write(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -25,6 +27,9 @@ def log_message(
     routing_intent: str = "",
 ) -> None:
     """Append one line to chat.log after every successful chat response."""
+    turn_tokens = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+    _session_tokens[session_id] = _session_tokens.get(session_id, 0) + turn_tokens
+
     payload: dict = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "session_id": session_id,
@@ -34,7 +39,7 @@ def log_message(
         "question": question,
         "prompt_tokens": usage.get("prompt_tokens", 0),
         "completion_tokens": usage.get("completion_tokens", 0),
-        "total_tokens": usage.get("total_tokens", 0),
+        "session_tokens": _session_tokens[session_id],
     }
     if routing_intent:
         payload["routing_intent"] = routing_intent

@@ -5,7 +5,7 @@ from typing import Annotated, Literal, TypedDict
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from chat_history import ChatHistoryStore, TopicClusterer, classify_query, retrieve_for_query
+from chat_history import ChatHistoryStore, ChunkSummarizer, TopicClusterer, classify_query, retrieve_for_query
 from helpers.log import log_debug, log_message
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, trim_messages
 from rag import DocumentRAGStore, SessionRAGStore
@@ -32,6 +32,7 @@ SUMMARIZE_AFTER = int(os.getenv("SUMMARIZE_AFTER", "6"))    # message count
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))               # top-k retrieved messages
 DOC_TOP_K = int(os.getenv("DOC_TOP_K", "3"))               # top-k document chunks
 WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "6"))           # smart: sliding window length
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "6"))             # smart: messages per summary chunk
 TOPIC_NAMING_MODEL = os.getenv("TOPIC_NAMING_MODEL", "gpt-4o-mini")
 TOPIC_SIMILARITY_THRESHOLD = float(os.getenv("TOPIC_SIMILARITY_THRESHOLD", "0.65"))
 
@@ -62,6 +63,7 @@ def _make_llm(model: str) -> ChatOpenAI:
 def build_graph() -> StateGraph:
     rag_store = SessionRAGStore() if HISTORY_STRATEGY == "rag" else None
     chat_store = None
+    summarizer = None
     if HISTORY_STRATEGY == "smart":
         clusterer = TopicClusterer(
             embeddings=get_embeddings(),
@@ -69,6 +71,7 @@ def build_graph() -> StateGraph:
             similarity_threshold=TOPIC_SIMILARITY_THRESHOLD,
         )
         chat_store = ChatHistoryStore(clusterer)
+        summarizer = ChunkSummarizer(llm=_make_llm(TOPIC_NAMING_MODEL), chunk_size=CHUNK_SIZE)
 
     async def call_model(state: State, config: RunnableConfig):
         model_name = config["configurable"].get("model", DEFAULT_MODEL)
@@ -125,6 +128,7 @@ def build_graph() -> StateGraph:
                 query=current_text,
                 rag_k=RAG_TOP_K,
                 window_size=WINDOW_SIZE,
+                summarizer=summarizer,
             )
             if extra_context:
                 system_content += f"\n\n{extra_context}"

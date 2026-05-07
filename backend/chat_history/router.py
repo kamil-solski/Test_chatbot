@@ -22,8 +22,8 @@ class RoutingDecision:
 
 
 _POSITION_PATTERNS = [
-    re.compile(r"\b(first|initial|original|starting)\s+(prompt|message|question)\b"),
-    re.compile(r"\b(last|previous|prior)\s+(prompt|message|question)\b"),
+    re.compile(r"\b(first|initial|original|starting)\s+(prompt|message|question|topic|subject|thing|discussion)\b"),
+    re.compile(r"\b(last|previous|prior)\s+(prompt|message|question|topic|subject|thing|discussion)\b"),
     re.compile(r"\b(\d+)(st|nd|rd|th)?\s+(prompt|message|question)\b"),
     re.compile(r"\bwhat\s+(was|did)\s+i\s+(ask|say)\s+(first|initially|originally)\b"),
 ]
