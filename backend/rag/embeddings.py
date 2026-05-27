@@ -1,19 +1,21 @@
-import os
 from functools import lru_cache
+
+from config import CONFIG, EMBEDDING_MODEL_PATH, OPENAI_API_KEY
 
 
 @lru_cache(maxsize=1)
 def get_embeddings():
-    provider = os.getenv("EMBEDDING_PROVIDER", "openai").lower()
+    provider = str(CONFIG["embeddings"]["provider"]).lower()
 
     if provider == "local":
         from langchain_huggingface import HuggingFaceEmbeddings
-        model_name = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
-        model_path = os.getenv("EMBEDDING_MODEL_PATH", "/app/models")
-        return HuggingFaceEmbeddings(model_name=model_name, cache_folder=model_path)
+        return HuggingFaceEmbeddings(
+            model_name=CONFIG["embeddings"]["model_name"],
+            cache_folder=EMBEDDING_MODEL_PATH,
+        )
 
     from langchain_openai import OpenAIEmbeddings
     return OpenAIEmbeddings(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+        api_key=OPENAI_API_KEY,
+        model=CONFIG["embeddings"]["model"],
     )

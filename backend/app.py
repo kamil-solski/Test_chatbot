@@ -1,12 +1,11 @@
-import os
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal, TypedDict
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from chat_history import ChatHistoryStore, ChunkSummarizer, TopicClusterer, classify_query, retrieve_for_query
-from helpers.log import log_debug, log_message
+from config import CONFIG, LITELLM_BASE_URL, OPENAI_API_KEY, REDIS_URL
+from helpers.log import log_message
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, trim_messages
 from rag import DocumentRAGStore, SessionRAGStore
 from rag.embeddings import get_embeddings
@@ -17,30 +16,20 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel
 
-load_dotenv()
+DEFAULT_MODEL: str = CONFIG["llm"]["default_model"]
+LLM_TEMPERATURE: float = CONFIG["llm"]["temperature"]
+DEFAULT_SYSTEM_PROMPT: str = CONFIG["llm"]["system_prompt"]
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL")
-DEFAULT_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "1.0"))
-DEFAULT_SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+HISTORY_STRATEGY: str = CONFIG["history"]["strategy"]
+MAX_HISTORY_TOKENS: int = CONFIG["history"]["max_tokens"]
+SUMMARIZE_AFTER: int = CONFIG["history"]["summarize_after"]
+RAG_TOP_K: int = CONFIG["history"]["rag_top_k"]
+WINDOW_SIZE: int = CONFIG["history"]["window_size"]
+CHUNK_SIZE: int = CONFIG["history"]["chunk_size"]
+TOPIC_NAMING_MODEL: str = CONFIG["history"]["topic_naming_model"]
+TOPIC_SIMILARITY_THRESHOLD: float = CONFIG["history"]["topic_similarity_threshold"]
 
-HISTORY_STRATEGY = os.getenv("HISTORY_STRATEGY", "full")   # full | trim | summarize | rag | smart
-MAX_HISTORY_TOKENS = int(os.getenv("MAX_HISTORY_TOKENS", "2000"))
-SUMMARIZE_AFTER = int(os.getenv("SUMMARIZE_AFTER", "6"))    # message count
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))               # top-k retrieved messages
-DOC_TOP_K = int(os.getenv("DOC_TOP_K", "3"))               # top-k document chunks
-WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "6"))           # smart: sliding window length
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "6"))             # smart: messages per summary chunk
-TOPIC_NAMING_MODEL = os.getenv("TOPIC_NAMING_MODEL", "gpt-4o-mini")
-TOPIC_SIMILARITY_THRESHOLD = float(os.getenv("TOPIC_SIMILARITY_THRESHOLD", "0.65"))
-
-log_debug("app.py:startup", "backend started", {
-    "LITELLM_BASE_URL": str(LITELLM_BASE_URL),
-    "DEFAULT_MODEL": DEFAULT_MODEL,
-    "HISTORY_STRATEGY": HISTORY_STRATEGY,
-})
+DOC_TOP_K: int = CONFIG["rag"]["doc_top_k"]
 
 doc_store = DocumentRAGStore()
 
@@ -78,8 +67,6 @@ def build_graph() -> StateGraph:
         llm = _make_llm(model_name)
         session_id = config["configurable"]["thread_id"]
 
-        log_debug("app.py:call_model", "invoking LLM", {"model": model_name, "strategy": HISTORY_STRATEGY})
-
         summary = state.get("summary", "")
         system_content = DEFAULT_SYSTEM_PROMPT
         if summary:
@@ -115,11 +102,6 @@ def build_graph() -> StateGraph:
             current_text = messages[-1].content
             available_topics = chat_store.list_topics(session_id)
             decision = classify_query(current_text, available_topics)
-            log_debug("app.py:call_model", "routing decision", {
-                "intent": decision.intent.value,
-                "reason": decision.reason,
-                "topic_filter": decision.topic_filter,
-            })
             messages, extra_context = await retrieve_for_query(
                 decision=decision,
                 messages=messages,
@@ -135,9 +117,6 @@ def build_graph() -> StateGraph:
 
         response = await llm.ainvoke([SystemMessage(content=system_content)] + messages)
 
-        log_debug("app.py:call_model", "LLM responded", {
-            "response_model": getattr(response, "response_metadata", {}).get("model_name", "unknown"),
-        })
         result: dict = {"messages": [response]}
         if HISTORY_STRATEGY == "smart":
             result["routing_intent"] = decision.intent.value
@@ -217,11 +196,6 @@ def health():
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    log_debug("app.py:chat", "request received", {
-        "model": request.model,
-        "session_id": request.session_id,
-    })
-
     config = {
         "configurable": {
             "thread_id": request.session_id,

@@ -17,9 +17,11 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - LITELLM_BASE_URL=http://litellm:4000/v1
+      - CONFIG_PATH=/app/config.yaml
     ports:
       - "8000:8000"     # exposed for direct dev access / Live Server mode
     volumes:
+      - ./config.yaml:/app/config.yaml:ro
       - ./logs:/app/logs
       - ./models:/app/models
     depends_on:

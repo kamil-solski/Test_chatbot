@@ -1,12 +1,10 @@
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-_DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+from config import CONFIG
 
-CHAT_LOG = Path(os.getenv("CHAT_LOG", "logs/chat.log"))
-DEBUG_LOG = Path(os.getenv("DEBUG_LOG", "logs/debug.log"))
+CHAT_LOG = Path(CONFIG["logging"]["chat_log"])
 
 _session_tokens: dict[str, int] = {}
 
@@ -44,15 +42,3 @@ def log_message(
     if routing_intent:
         payload["routing_intent"] = routing_intent
     _write(CHAT_LOG, payload)
-
-
-def log_debug(location: str, message: str, data: dict) -> None:
-    """Append one line to debug.log. Only active when DEBUG=true."""
-    if not _DEBUG:
-        return
-    _write(DEBUG_LOG, {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "location": location,
-        "message": message,
-        "data": data,
-    })
