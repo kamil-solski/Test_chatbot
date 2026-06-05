@@ -1,16 +1,30 @@
-"""CLI runner for the evaluation module.
+"""Evaluation runner — evaluates a live chat session stored in Postgres.
 
-Run from the backend/ directory:
-    python -m eval.run                        # router only (no API key needed)
-    python -m eval.run -c summarizer          # summarizer (needs OPENAI_API_KEY)
-    python -m eval.run -c retrieval           # retrieval  (needs OPENAI_API_KEY)
-    python -m eval.run -c e2e                 # e2e notes  (shows usage instructions)
-    python -m eval.run -c all                 # router + summarizer + retrieval
+Run from inside the backend container:
+
+    docker compose exec backend python -m eval.run --session <uuid>
+    docker compose exec backend python -m eval.run --session <uuid> -c router
+    docker compose exec backend python -m eval.run --session <uuid> -c all
+
+The runner reads the session's turns and chunk summaries from Postgres, fires
+the relevant judges, prints a summary, and appends an eval_runs row to the DB
+for historical comparison.
 """
 import argparse
 import asyncio
 
+from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage
+
+import db
+from chat_history.router import Intent, classify_query
 from config import CONFIG, LITELLM_BASE_URL, OPENAI_API_KEY
+from eval.e2e_eval import evaluate_responses
+from eval.retrieval_eval import evaluate_retrieval
+from eval.router_eval import RouterCase, evaluate_router
+from eval.summarizer_eval import evaluate_summarizer
+
+VALID_INTENTS = {i.value for i in Intent}
 
 
 def _make_llm():
@@ -24,166 +38,315 @@ def _make_llm():
 
 
 # --------------------------------------------------------------------------- #
-# Router                                                                        #
+# Router (uses LLM judge to label unlabeled queries)                            #
 # --------------------------------------------------------------------------- #
 
-def run_router() -> None:
-    from eval.router_eval import evaluate_router
+async def _judge_intent(llm, query: str) -> str:
+    prompt = f"""Classify this query into exactly one of these intent labels:
+- continuation  (short follow-up; the previous turn carries the context)
+- normal        (standalone new question, no recall of prior turns needed)
+- position      (asks about the first/last/Nth previous prompt or topic)
+- topic_recall  (refers back to a specific named topic discussed earlier)
+- semantic_recall (asks about something said earlier without naming a specific topic)
 
-    # No available_topics — matches a fresh chat session before any topic
-    # cluster has formed. Case #16 will misclassify as SEMANTIC_RECALL because
-    # of this; see README "Router known under-classifications".
-    report = evaluate_router()
+Reply with ONLY the label, nothing else.
 
-    print("\n=== Router Evaluation ===")
-    print(f"Accuracy: {report.correct}/{report.total}  ({report.accuracy:.1%})")
+Query: {query}"""
+    response = await llm.ainvoke(prompt)
+    label = response.content.strip().lower().split()[0] if response.content.strip() else ""
+    return label if label in VALID_INTENTS else "normal"
 
-    if report.failures:
-        print(f"\nFailures ({len(report.failures)}):")
-        for f in report.failures:
-            print(f"  #{f['id']:>2}  {f['prompt'][:65]!r}")
-            print(f"        expected={f['expected']}  predicted={f['predicted']}")
-            if f["notes"]:
-                print(f"        note: {f['notes']}")
 
-    print("\nPer-class metrics:")
-    for cls, m in sorted(report.per_class.items()):
-        print(f"  {cls:<20}  P={m['precision']:.3f}  R={m['recall']:.3f}  F1={m['f1']:.3f}")
+async def run_router_eval(session_id: str, turns: list[dict], llm) -> dict:
+    """Evaluate the router on session turns.
 
-    print("\nConfusion matrix (expected → predicted):")
-    all_intents = sorted({k for row in report.confusion.values() for k in row} | set(report.confusion))
-    header = f"{'':20}" + "".join(f"{c:>18}" for c in all_intents)
-    print("  " + header)
-    for expected in all_intents:
-        row = report.confusion.get(expected, {})
-        cells = "".join(f"{row.get(p, 0):>18}" for p in all_intents)
-        print(f"  {expected:<20}{cells}")
+    y_true comes from: intent_user_override (if set) → intent_judge_label
+    (cached LLM label) → fresh LLM judge call (then cached back to DB).
+    """
+    cases: list[RouterCase] = []
+    per_turn = []
+
+    for t in turns:
+        question = t["question"]
+        routing = t.get("routing") or {}
+        intent_predicted_str = routing.get("intent")
+
+        # Resolve y_true
+        y_true = t.get("intent_user_override") or t.get("intent_judge_label")
+        if not y_true:
+            y_true = await _judge_intent(llm, question)
+            await db.update_turn_judge_label(t["id"], y_true)
+
+        try:
+            expected = Intent(y_true)
+        except ValueError:
+            continue  # judge returned something unrecognized; skip this turn
+
+        cases.append(RouterCase(
+            id=t["turn_number"],
+            prompt=question,
+            expected_intent=expected,
+        ))
+        per_turn.append({
+            "turn_number": t["turn_number"],
+            "intent_predicted": intent_predicted_str,
+            "intent_y_true": y_true,
+            "agree": intent_predicted_str == y_true,
+        })
+
+    if not cases:
+        return {"summary": {"router_n": 0}, "per_turn": per_turn}
+
+    report = evaluate_router(cases=cases)
+    return {
+        "summary": {
+            "router_accuracy": report.accuracy,
+            "router_n": report.total,
+            "router_per_class": report.per_class,
+        },
+        "per_turn": per_turn,
+    }
 
 
 # --------------------------------------------------------------------------- #
-# Summarizer                                                                    #
+# Retrieval (only meaningful for turns that actually retrieved docs)            #
 # --------------------------------------------------------------------------- #
 
-async def run_summarizer() -> None:
-    from eval.summarizer_eval import evaluate_live
-    from eval.dataset import SAMPLE_CONVERSATION
-
-    llm = _make_llm()
-    print("\n=== Summarizer Evaluation ===")
-    print(f"Conversation: {len(SAMPLE_CONVERSATION)} messages, chunk_size=4, window_size=2")
-
-    report = await evaluate_live(llm, SAMPLE_CONVERSATION, chunk_size=4, window_size=2)
-
-    if not report.samples:
-        print("No chunks produced — conversation too short for given chunk_size/window_size.")
-        return
-
-    print(f"ROUGE-L mean:      {report.rouge_l_mean if report.rouge_l_mean is not None else 'n/a (install rouge-score)'}")
-    print(f"Faithfulness mean: {report.faithfulness_mean:.2f} / 5.0")
-    for i, s in enumerate(report.samples, 1):
-        print(f"  Chunk {i}: ROUGE-L={s['rouge_l']}  Faithfulness={s['faithfulness']}")
-
-
-# --------------------------------------------------------------------------- #
-# Retrieval                                                                     #
-# --------------------------------------------------------------------------- #
-
-async def run_retrieval() -> None:
-    from eval.retrieval_eval import evaluate_retrieval
-    from eval.dataset import SAMPLE_CONVERSATION
-    from rag.store import SessionRAGStore
-
-    llm = _make_llm()
-    store = SessionRAGStore()
-
-    print("\n=== Retrieval Evaluation ===")
-    print("Indexing sample conversation into SessionRAGStore...")
-    store.index_messages("_eval", SAMPLE_CONVERSATION)
-
-    queries = [
-        "What is prompt engineering?",
-        "What is my favorite programming language?",
-    ]
-
-    from langchain_core.documents import Document
-
+async def run_retrieval_eval(turns: list[dict], llm) -> dict:
     samples = []
-    all_docs: list[Document] = store.retrieve("_eval", "anything", k=len(SAMPLE_CONVERSATION))
-    for q in queries:
-        retrieved = store.retrieve("_eval", q, k=4)
-        samples.append({"query": q, "retrieved": retrieved, "all_docs": all_docs})
+    sample_to_turn = []
+
+    # Build a session-wide pool of all retrieved docs for recall computation
+    all_seen: list[dict] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for t in turns:
+        for doc in t.get("retrieved") or []:
+            key = (doc.get("role", "human"), doc.get("content", ""))
+            if key not in seen_keys:
+                seen_keys.add(key)
+                all_seen.append(doc)
+    all_docs = [Document(page_content=d["content"], metadata={"role": d.get("role", "human")}) for d in all_seen]
+
+    for t in turns:
+        retrieved_raw = t.get("retrieved") or []
+        if not retrieved_raw:
+            continue
+        retrieved_docs = [
+            Document(page_content=d["content"], metadata={"role": d.get("role", "human")})
+            for d in retrieved_raw
+        ]
+        samples.append({
+            "query": t["question"],
+            "retrieved": retrieved_docs,
+            "all_docs": all_docs,
+        })
+        sample_to_turn.append(t["turn_number"])
+
+    if not samples:
+        return {"summary": {"retrieval_n": 0}, "per_turn": []}
 
     report = await evaluate_retrieval(llm, samples)
-
-    print(f"Context Precision mean: {report.precision_mean:.3f}")
-    if report.recall_mean is not None:
-        print(f"Context Recall mean:    {report.recall_mean:.3f}")
-    for s in report.samples:
-        recall_str = f"  Recall={s['recall']}" if s["recall"] is not None else ""
-        print(f"  {s['query']!r}")
-        print(f"    Retrieved={s['retrieved_count']}  Relevant={s['relevant_retrieved']}  Precision={s['precision']}{recall_str}")
-
-
-# --------------------------------------------------------------------------- #
-# E2E                                                                           #
-# --------------------------------------------------------------------------- #
-
-def run_e2e_help() -> None:
-    print("""
-=== E2E Evaluation ===
-E2E evaluation requires recorded (question, response) pairs from a live session.
-
-Steps:
-  1. Run the 18 prompts from eval/dataset.py through /api/chat with the desired
-     history.strategy (one chat session per strategy you want to compare).
-  2. Capture each (question, response) pair from the API response.
-  3. Call evaluate_responses() with the recorded samples:
-
-    from eval import evaluate_responses
-    from langchain_openai import ChatOpenAI
-
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
-    samples = [
+    per_turn = [
         {
-            "question": "What was the first topic we discussed?",
-            "response": "<captured model response>",
-            "reference": "Prompt engineering",
-            "context": "<context injected by the strategy>",
-        },
-        ...
+            "turn_number": sample_to_turn[i],
+            "retrieval_precision": s["precision"],
+            "retrieval_recall": s["recall"],
+            "retrieved_count": s["retrieved_count"],
+            "relevant_retrieved": s["relevant_retrieved"],
+        }
+        for i, s in enumerate(report.samples)
     ]
+    return {
+        "summary": {
+            "retrieval_precision_mean": report.precision_mean,
+            "retrieval_recall_mean": report.recall_mean,
+            "retrieval_n": len(samples),
+        },
+        "per_turn": per_turn,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Summarizer (only meaningful for smart strategy with chunk summaries)          #
+# --------------------------------------------------------------------------- #
+
+async def run_summarizer_eval(session_id: str, llm) -> dict:
+    chunks = await db.fetch_session_chunks(session_id)
+    if not chunks:
+        return {"summary": {"summarizer_n": 0}, "per_chunk": []}
+
+    samples = []
+    for c in chunks:
+        msgs = []
+        for m in c["source_messages"]:
+            cls = HumanMessage if m.get("role") == "human" else AIMessage
+            msgs.append(cls(content=m.get("content", "")))
+        samples.append((msgs, c["summary_text"]))
+
+    report = await evaluate_summarizer(llm, samples)
+    per_chunk = [
+        {
+            "chunk_index": chunks[i]["chunk_index"],
+            "rouge_l": s["rouge_l"],
+            "faithfulness": s["faithfulness"],
+        }
+        for i, s in enumerate(report.samples)
+    ]
+    return {
+        "summary": {
+            "summarizer_rouge_l_mean": report.rouge_l_mean,
+            "summarizer_faithfulness_mean": report.faithfulness_mean,
+            "summarizer_n": len(report.samples),
+        },
+        "per_chunk": per_chunk,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# E2E (judges each response against optional reference + context)               #
+# --------------------------------------------------------------------------- #
+
+async def run_e2e_eval(turns: list[dict], llm) -> dict:
+    samples = []
+    sample_to_turn = []
+    for t in turns:
+        samples.append({
+            "question": t["question"],
+            "response": t["response"],
+            "reference": t.get("reference_answer") or "",
+            "context": t.get("context_injected") or "",
+        })
+        sample_to_turn.append(t["turn_number"])
+
+    if not samples:
+        return {"summary": {"e2e_n": 0}, "per_turn": []}
+
     report = await evaluate_responses(llm, samples)
-    print(report)
-
-See eval/dataset.py -> E2E_REFERENCES for reference answers to the 18-prompt test set.
-""")
+    per_turn = [
+        {
+            "turn_number": sample_to_turn[i],
+            "e2e_correctness": s.get("correctness"),
+            "e2e_coherence": s.get("coherence"),
+            "e2e_groundedness": s.get("groundedness"),
+        }
+        for i, s in enumerate(report.samples)
+    ]
+    return {
+        "summary": {
+            "e2e_correctness_mean": report.correctness_mean,
+            "e2e_coherence_mean": report.coherence_mean,
+            "e2e_groundedness_mean": report.groundedness_mean,
+            "e2e_n": len(samples),
+        },
+        "per_turn": per_turn,
+    }
 
 
 # --------------------------------------------------------------------------- #
-# Entry point                                                                   #
+# Orchestration                                                                 #
 # --------------------------------------------------------------------------- #
+
+async def run_session_eval(session_id: str, component: str) -> None:
+    await db.init_pool()
+    try:
+        turns = await db.fetch_session_turns(session_id)
+        if not turns:
+            print(f"No turns found for session {session_id}.")
+            print("Chat in the GUI first, then re-run.")
+            return
+
+        llm = _make_llm()
+        aggregate: dict = {}
+        per_turn_by_number: dict[int, dict] = {t["turn_number"]: {"turn_number": t["turn_number"]} for t in turns}
+        per_chunk_results: list[dict] = []
+
+        if component in ("router", "all"):
+            r = await run_router_eval(session_id, turns, llm)
+            aggregate.update(r["summary"])
+            for pt in r["per_turn"]:
+                per_turn_by_number.setdefault(pt["turn_number"], {"turn_number": pt["turn_number"]}).update(pt)
+
+        if component in ("retrieval", "all"):
+            r = await run_retrieval_eval(turns, llm)
+            aggregate.update(r["summary"])
+            for pt in r["per_turn"]:
+                per_turn_by_number.setdefault(pt["turn_number"], {"turn_number": pt["turn_number"]}).update(pt)
+
+        if component in ("summarizer", "all"):
+            r = await run_summarizer_eval(session_id, llm)
+            aggregate.update(r["summary"])
+            per_chunk_results = r.get("per_chunk", [])
+
+        if component in ("e2e", "all"):
+            r = await run_e2e_eval(turns, llm)
+            aggregate.update(r["summary"])
+            for pt in r["per_turn"]:
+                per_turn_by_number.setdefault(pt["turn_number"], {"turn_number": pt["turn_number"]}).update(pt)
+
+        per_turn_results = sorted(per_turn_by_number.values(), key=lambda x: x["turn_number"])
+        _print_report(session_id, len(turns), aggregate, per_turn_results, per_chunk_results)
+
+        await db.insert_eval_run(
+            session_id=session_id,
+            judge_model=CONFIG["eval"]["judge_model"],
+            turns_evaluated=len(turns),
+            aggregate_metrics=aggregate,
+            per_turn_results=per_turn_results,
+        )
+        print(f"\nResults saved to eval_runs (session_id={session_id}).")
+    finally:
+        await db.close_pool()
+
+
+def _print_report(session_id, n_turns, aggregate, per_turn, per_chunk):
+    print("\n=== Evaluation Session Summary ===")
+    print(f"Session: {session_id}")
+    print(f"Turns evaluated: {n_turns}")
+    print(f"Judge model: {CONFIG['eval']['judge_model']}")
+
+    print("\n--- Aggregate metrics ---")
+    for k in sorted(aggregate.keys()):
+        v = aggregate[k]
+        if isinstance(v, dict):
+            print(f"  {k}:")
+            for sub_k, sub_v in v.items():
+                print(f"    {sub_k}: {sub_v}")
+        else:
+            print(f"  {k}: {v}")
+
+    if per_turn:
+        print("\n--- Per-turn ---")
+        for pt in per_turn:
+            line = f"  #{pt['turn_number']:>2}  "
+            extras = []
+            if "agree" in pt:
+                ok = "OK" if pt["agree"] else "MISS"
+                extras.append(f"router={pt.get('intent_predicted')}->{pt.get('intent_y_true')} [{ok}]")
+            if "retrieval_precision" in pt:
+                extras.append(f"P={pt['retrieval_precision']} R={pt['retrieval_recall']}")
+            if "e2e_correctness" in pt:
+                extras.append(
+                    f"e2e={pt.get('e2e_correctness')}/{pt.get('e2e_coherence')}/{pt.get('e2e_groundedness')}"
+                )
+            print(line + " | ".join(extras))
+
+    if per_chunk:
+        print("\n--- Per-chunk (summarizer) ---")
+        for pc in per_chunk:
+            print(f"  chunk {pc['chunk_index']}  ROUGE-L={pc['rouge_l']}  faithfulness={pc['faithfulness']}")
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Eval runner — run from backend/ directory")
+    parser = argparse.ArgumentParser(description="Eval runner — evaluates a live session from Postgres")
+    parser.add_argument("--session", required=True, help="Session UUID to evaluate")
     parser.add_argument(
         "-c", "--component",
         choices=["router", "summarizer", "retrieval", "e2e", "all"],
-        default="router",
-        help="Component to evaluate (default: router, the only one that needs no API key)",
+        default="all",
+        help="Component to evaluate (default: all)",
     )
     args = parser.parse_args()
-
-    if args.component in ("router", "all"):
-        run_router()
-
-    if args.component in ("summarizer", "all"):
-        asyncio.run(run_summarizer())
-
-    if args.component in ("retrieval", "all"):
-        asyncio.run(run_retrieval())
-
-    if args.component == "e2e":
-        run_e2e_help()
+    asyncio.run(run_session_eval(args.session, args.component))
 
 
 if __name__ == "__main__":

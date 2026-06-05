@@ -3,6 +3,24 @@ services:
     image: redis:8.0-alpine
     restart: unless-stopped
 
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    ports:
+      - "5441:5432"   # exposed for local GUI (pgAdmin / DBeaver / TablePlus / psql)
+    environment:
+      - POSTGRES_USER=${PG_USER:-chatbot}
+      - POSTGRES_PASSWORD=${PG_PASSWORD:-changeme}
+      - POSTGRES_DB=${PG_DB:-chatbot}
+    volumes:
+      - pg_data_test_chatbot:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   litellm:
     image: litellm/litellm:main-v1.83.7-stable
     env_file: .env
@@ -18,15 +36,19 @@ services:
       - REDIS_URL=redis://redis:6379
       - LITELLM_BASE_URL=http://litellm:4000/v1
       - CONFIG_PATH=/app/config.yaml
+      - POSTGRES_DSN=postgresql://${PG_USER:-chatbot}:${PG_PASSWORD:-changeme}@postgres:5432/${PG_DB:-chatbot}
     ports:
       - "8000:8000"     # exposed for direct dev access / Live Server mode
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-      - ./logs:/app/logs
       - ./models:/app/models
     depends_on:
-      - redis
-      - litellm
+      redis:
+        condition: service_started
+      litellm:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -41,3 +63,6 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  pg_data_test_chatbot:

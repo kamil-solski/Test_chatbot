@@ -28,8 +28,12 @@ async def retrieve_for_query(
     rag_k: int = 4,
     window_size: int = 6,
     summarizer: "ChunkSummarizer | None" = None,
-) -> tuple[list[BaseMessage], str]:
-    """Returns (messages_for_llm, extra_system_context)."""
+) -> tuple[list[BaseMessage], str, list[dict]]:
+    """Returns (messages_for_llm, extra_system_context, retrieved_metadata).
+
+    retrieved_metadata is a list of {role, content} dicts representing what
+    came back from vector retrieval (empty for non-vector paths).
+    """
     current = messages[-1]
     history = messages[:-1]
 
@@ -44,7 +48,7 @@ async def retrieve_for_query(
         extra = f"Relevant raw log entry:\n{position_info}"
         if chunk_context:
             extra = chunk_context + "\n\n" + extra
-        return [current], extra
+        return [current], extra, []
 
     if decision.use_vector:
         docs = store.retrieve(
@@ -55,10 +59,14 @@ async def retrieve_for_query(
             role_map.get(d.metadata.get("role"), HumanMessage)(content=d.page_content)
             for d in docs
         ]
-        return retrieved + [current], chunk_context
+        retrieved_meta = [
+            {"role": d.metadata.get("role", "human"), "content": d.page_content}
+            for d in docs
+        ]
+        return retrieved + [current], chunk_context, retrieved_meta
 
     # CONTINUATION / NORMAL: sliding window + chunk summaries
-    return history[-window_size:] + [current], chunk_context
+    return history[-window_size:] + [current], chunk_context, []
 
 
 def _resolve_position(query: str, history: list[BaseMessage]) -> str:

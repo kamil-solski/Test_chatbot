@@ -5,8 +5,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from chat_history import ChatHistoryStore, ChunkSummarizer, TopicClusterer, classify_query, retrieve_for_query
 from config import CONFIG, LITELLM_BASE_URL, OPENAI_API_KEY, REDIS_URL
-from helpers.log import log_message
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, trim_messages
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, trim_messages
 from rag import DocumentRAGStore, SessionRAGStore
 from rag.embeddings import get_embeddings
 from langchain_core.runnables import RunnableConfig
@@ -15,6 +14,8 @@ from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel
+
+import db
 
 DEFAULT_MODEL: str = CONFIG["llm"]["default_model"]
 LLM_TEMPERATURE: float = CONFIG["llm"]["temperature"]
@@ -38,6 +39,9 @@ class State(TypedDict):
     messages: Annotated[list, add_messages]
     summary: str
     routing_intent: str
+    routing_data: dict | None      # {intent, reason, topic_filter} — None for non-smart strategies
+    retrieved_docs: list | None    # [{role, content}, ...] — None when no vector retrieval happened
+    context_injected: str | None   # the full system_content sent to the LLM
 
 
 def _token_count(messages: list) -> int:
@@ -47,6 +51,13 @@ def _token_count(messages: list) -> int:
 
 def _make_llm(model: str) -> ChatOpenAI:
     return ChatOpenAI(model=model, api_key=OPENAI_API_KEY, base_url=LITELLM_BASE_URL, temperature=LLM_TEMPERATURE)
+
+
+def _msg_to_dict(m: BaseMessage) -> dict:
+    """Convert a LangChain message to a {role, content} dict for JSON storage."""
+    role = "human" if isinstance(m, HumanMessage) else ("ai" if isinstance(m, AIMessage) else type(m).__name__.lower())
+    content = m.content if isinstance(m.content, str) else str(m.content)
+    return {"role": role, "content": content}
 
 
 def build_graph() -> StateGraph:
@@ -60,7 +71,20 @@ def build_graph() -> StateGraph:
             similarity_threshold=TOPIC_SIMILARITY_THRESHOLD,
         )
         chat_store = ChatHistoryStore(clusterer)
-        summarizer = ChunkSummarizer(llm=_make_llm(TOPIC_NAMING_MODEL), chunk_size=CHUNK_SIZE)
+
+        async def _persist_chunk(session_id, chunk_index, batch, summary):
+            await db.insert_chunk_summary(
+                session_id=session_id,
+                chunk_index=chunk_index,
+                source_messages=[_msg_to_dict(m) for m in batch],
+                summary_text=summary,
+            )
+
+        summarizer = ChunkSummarizer(
+            llm=_make_llm(TOPIC_NAMING_MODEL),
+            chunk_size=CHUNK_SIZE,
+            on_summary_created=_persist_chunk,
+        )
 
     async def call_model(state: State, config: RunnableConfig):
         model_name = config["configurable"].get("model", DEFAULT_MODEL)
@@ -81,6 +105,9 @@ def build_graph() -> StateGraph:
                 system_content += f"\n\nRelevant context from uploaded documents:\n{context_block}"
 
         messages = state["messages"]
+        routing_data: dict | None = None
+        retrieved_docs: list | None = None
+        decision = None
 
         if HISTORY_STRATEGY == "trim":
             messages = trim_messages(
@@ -97,12 +124,16 @@ def build_graph() -> StateGraph:
             docs = rag_store.retrieve(session_id, current.content, k=RAG_TOP_K)
             role_map = {"human": HumanMessage, "ai": AIMessage}
             retrieved = [role_map.get(d.metadata["role"], HumanMessage)(content=d.page_content) for d in docs]
+            retrieved_docs = [
+                {"role": d.metadata.get("role", "human"), "content": d.page_content}
+                for d in docs
+            ]
             messages = retrieved + [current]
         elif HISTORY_STRATEGY == "smart":
             current_text = messages[-1].content
             available_topics = chat_store.list_topics(session_id)
             decision = classify_query(current_text, available_topics)
-            messages, extra_context = await retrieve_for_query(
+            messages, extra_context, retrieved_meta = await retrieve_for_query(
                 decision=decision,
                 messages=messages,
                 store=chat_store,
@@ -114,11 +145,22 @@ def build_graph() -> StateGraph:
             )
             if extra_context:
                 system_content += f"\n\n{extra_context}"
+            routing_data = {
+                "intent": decision.intent.value,
+                "reason": decision.reason,
+                "topic_filter": decision.topic_filter,
+            }
+            retrieved_docs = retrieved_meta or None
 
         response = await llm.ainvoke([SystemMessage(content=system_content)] + messages)
 
-        result: dict = {"messages": [response]}
-        if HISTORY_STRATEGY == "smart":
+        result: dict = {
+            "messages": [response],
+            "routing_data": routing_data,
+            "retrieved_docs": retrieved_docs,
+            "context_injected": system_content,
+        }
+        if HISTORY_STRATEGY == "smart" and decision is not None:
             result["routing_intent"] = decision.intent.value
         return result
 
@@ -159,10 +201,14 @@ def build_graph() -> StateGraph:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with AsyncRedisSaver.from_conn_string(REDIS_URL) as checkpointer:
-        await checkpointer.asetup()
-        app.state.graph = build_graph().compile(checkpointer=checkpointer)
-        yield
+    await db.init_pool()
+    try:
+        async with AsyncRedisSaver.from_conn_string(REDIS_URL) as checkpointer:
+            await checkpointer.asetup()
+            app.state.graph = build_graph().compile(checkpointer=checkpointer)
+            yield
+    finally:
+        await db.close_pool()
 
 
 app = FastAPI(title="Test Chatbot API", lifespan=lifespan)
@@ -194,6 +240,11 @@ def health():
     return {"status": "ok"}
 
 
+# In-memory cumulative session tokens for the `tokens.session_total` field.
+# Resets on container restart. Matches the previous chat.log behavior.
+_session_tokens: dict[str, int] = {}
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     config = {
@@ -220,14 +271,30 @@ async def chat(request: ChatRequest):
         "total_tokens": usage.get("total_tokens", 0),
     }
 
-    log_message(
+    turn_tokens = response_usage["prompt_tokens"] + response_usage["completion_tokens"]
+    _session_tokens[request.session_id] = _session_tokens.get(request.session_id, 0) + turn_tokens
+
+    await db.ensure_session(
         session_id=request.session_id,
-        model=request.model,
-        question=request.message,
-        usage=response_usage,
         strategy=HISTORY_STRATEGY,
         temperature=LLM_TEMPERATURE,
-        routing_intent=result.get("routing_intent", ""),
+        system_prompt=DEFAULT_SYSTEM_PROMPT,
+    )
+    turn_number = await db.next_turn_number(request.session_id)
+    await db.insert_turn(
+        session_id=request.session_id,
+        turn_number=turn_number,
+        model=request.model,
+        question=request.message,
+        response=ai_message.content,
+        context_injected=result.get("context_injected"),
+        routing=result.get("routing_data"),
+        retrieved=result.get("retrieved_docs"),
+        tokens={
+            "prompt": response_usage["prompt_tokens"],
+            "completion": response_usage["completion_tokens"],
+            "session_total": _session_tokens[request.session_id],
+        },
     )
 
     return ChatResponse(

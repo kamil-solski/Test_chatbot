@@ -20,17 +20,18 @@ class TopicClusterer:
         self._llm = llm
         self._threshold = similarity_threshold
         # session_id -> {"clusters": [{"centroid": np.ndarray, "name": str, "count": int}],
-        #                "message_topics": {message_id: topic_name}}
+        #                "seen_texts": {text: topic_name}}
+        # Cached by text content because msg.id is None for messages constructed
+        # without an explicit id (the common case).
         self._sessions: dict[str, dict] = {}
 
-    async def assign_topic(self, session_id: str, message_id: str, text: str) -> str:
+    async def assign_topic(self, session_id: str, text: str) -> str:
         sess = self._sessions.setdefault(
-            session_id, {"clusters": [], "message_topics": {}}
+            session_id, {"clusters": [], "seen_texts": {}}
         )
 
-        # Reuse cached topic if we've seen this message before
-        if message_id in sess["message_topics"]:
-            return sess["message_topics"][message_id]
+        if text in sess["seen_texts"]:
+            return sess["seen_texts"][text]
 
         embedding = np.array(await self._embeddings.aembed_query(text), dtype=np.float32)
 
@@ -55,7 +56,7 @@ class TopicClusterer:
                 "count": 1,
             })
 
-        sess["message_topics"][message_id] = topic
+        sess["seen_texts"][text] = topic
         return topic
 
     async def _name_topic(self, text: str) -> str:
@@ -74,12 +75,6 @@ class TopicClusterer:
         if not sess:
             return []
         return [c["name"] for c in sess["clusters"]]
-
-    def get_message_topic(self, session_id: str, message_id: str) -> str | None:
-        sess = self._sessions.get(session_id)
-        if not sess:
-            return None
-        return sess["message_topics"].get(message_id)
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:

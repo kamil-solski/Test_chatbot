@@ -1,10 +1,16 @@
 """Router classification accuracy — synchronous, no LLM required."""
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from chat_history.router import classify_query
+from chat_history.router import Intent, classify_query
 
-from .dataset import ROUTER_CASES, RouterCase
+
+@dataclass
+class RouterCase:
+    id: int
+    prompt: str
+    expected_intent: Intent
+    notes: str = ""
 
 
 @dataclass
@@ -18,19 +24,16 @@ class RouterReport:
 
 
 def evaluate_router(
-    cases: list[RouterCase] | None = None,
+    cases: list[RouterCase],
     available_topics: list[str] | None = None,
 ) -> RouterReport:
-    """Run the heuristic router on all labeled cases and return a RouterReport.
+    """Run the heuristic router on labeled cases and return a RouterReport.
 
     Args:
-        cases: Defaults to the 18-prompt ROUTER_CASES from dataset.py.
+        cases: Labeled (prompt, expected_intent) pairs to evaluate against.
         available_topics: Topic names to pass to classify_query (simulates a session
             that has already seen those topics). Relevant for TOPIC_RECALL cases.
     """
-    if cases is None:
-        cases = ROUTER_CASES
-
     correct = 0
     failures: list[dict] = []
     confusion: dict[str, dict] = defaultdict(lambda: defaultdict(int))

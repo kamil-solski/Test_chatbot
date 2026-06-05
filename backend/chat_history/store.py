@@ -12,7 +12,9 @@ class ChatHistoryStore:
     def __init__(self, clusterer: TopicClusterer) -> None:
         self._embeddings = get_embeddings()
         self._stores: dict[str, FAISS] = {}
-        self._indexed: dict[str, set] = {}
+        # Dedup by (role, content) — msg.id is None for messages constructed
+        # without an explicit id.
+        self._indexed: dict[str, set[tuple[str, str]]] = {}
         self._clusterer = clusterer
 
     async def index_messages(self, session_id: str, messages: list[BaseMessage]) -> None:
@@ -22,16 +24,18 @@ class ChatHistoryStore:
         new_docs: list[Document] = []
 
         for msg in messages:
-            msg_id = msg.id
-            if msg_id in indexed or not isinstance(msg.content, str) or not msg.content.strip():
+            if not isinstance(msg.content, str) or not msg.content.strip():
                 continue
             role = type(msg).__name__.replace("Message", "").lower()
-            topic = await self._clusterer.assign_topic(session_id, msg_id, msg.content)
+            key = (role, msg.content)
+            if key in indexed:
+                continue
+            topic = await self._clusterer.assign_topic(session_id, msg.content)
             new_docs.append(Document(
                 page_content=msg.content,
-                metadata={"role": role, "message_id": msg_id, "topic": topic},
+                metadata={"role": role, "message_id": msg.id, "topic": topic},
             ))
-            indexed.add(msg_id)
+            indexed.add(key)
 
         if not new_docs:
             return

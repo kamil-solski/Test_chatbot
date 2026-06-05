@@ -31,7 +31,3 @@ rag:
 
 eval:
   judge_model: gpt-4o-mini                                      # LLM used for relevance / faithfulness / e2e judging
-
-logging:
-  chat_log: logs/chat.log                                       # per-turn NDJSON
-

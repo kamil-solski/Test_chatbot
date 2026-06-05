@@ -19,13 +19,14 @@ LangGraph provides infrastructure (Redis checkpointing, graph execution) but the
 
 **Terminology distinction:** _Chat history_ = raw record of conversation saved to Redis. _Chat memory_ = what we choose to inject into context — the basis for reasoning. These are separate.
 
-- **Multi-strategy chat memory** (`HISTORY_STRATEGY`): `full`, `trim`, `summarize`, `rag`, `smart`
+- **Multi-strategy chat memory** (`history.strategy`): `full`, `trim`, `summarize`, `rag`, `smart`
 - **Smart strategy**: heuristic intent router → dispatches to window, chunk summaries, FAISS vector retrieval, or raw log scan per query
 - **Chunk summaries**: messages that leave the sliding window are batched and summarized, then injected as preamble — prevents context drift without compounding compression loss
 - **Document RAG**: upload `.txt` files per session; chunks injected into system prompt via FAISS retrieval
-- **Dual embedding backend**: `EMBEDDING_PROVIDER=openai` or `local` (HuggingFace)
+- **Dual embedding backend**: `embeddings.provider: openai` or `local` (HuggingFace)
 - **LiteLLM proxy**: switch between OpenAI, Anthropic, and other providers without changing backend code
-- **Structured logging**: per-turn NDJSON with cumulative session tokens, routing intent, temperature
+- **Postgres-backed storage**: every chat turn, chunk summary, and eval run persisted to Postgres with full schema (see `initdb/01_schema.sql`) for inspection via any SQL GUI
+- **Live-traffic evaluation**: `python -m eval.run --session <uuid>` evaluates a session against four judges (router accuracy, retrieval precision/recall, summarizer faithfulness, e2e quality)
 
 
 ## Structure
@@ -35,25 +36,23 @@ Test_chatbot/
 ├── backend/
 │   ├── app.py                    # FastAPI: /api/chat, /api/documents, LangGraph graph
 │   ├── config.py                 # Loads config.yaml + env credentials
+│   ├── db.py                     # Postgres pool + CRUD helpers
 │   ├── chat_history/             # Smart strategy components
 │   │   ├── clustering.py         # TopicClusterer — LLM-named embedding clusters
 │   │   ├── retrieval.py          # retrieve_for_query — dispatches by intent
 │   │   ├── router.py             # classify_query — heuristic intent classifier
 │   │   ├── store.py              # ChatHistoryStore — per-session FAISS + topic metadata
 │   │   └── summarizer.py         # ChunkSummarizer — outside-window batch summaries
-│   ├── eval/                     # Evaluation module (importable + CLI)
-│   │   ├── dataset.py            # Labeled test set: 18 router cases + sample conversation
+│   ├── eval/                     # Evaluation module (CLI + importable evaluators)
 │   │   ├── router_eval.py        # Classification accuracy / F1 — sync, no LLM
 │   │   ├── summarizer_eval.py    # ROUGE-L + LLM faithfulness judge
 │   │   ├── retrieval_eval.py     # Context precision + recall via LLM relevance judge
 │   │   ├── e2e_eval.py           # LLM-as-a-judge: correctness, coherence, groundedness
-│   │   └── run.py                # CLI runner
+│   │   └── run.py                # CLI: --session <uuid> reads from Postgres
 │   ├── rag/
 │   │   ├── doc_store.py          # DocumentRAGStore — per-session FAISS for uploaded docs
 │   │   ├── embeddings.py         # get_embeddings() factory (shared, lru_cache)
 │   │   └── store.py              # SessionRAGStore — used by rag strategy
-│   ├── helpers/
-│   │   └── log.py                # log_message
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── frontend/
@@ -63,10 +62,10 @@ Test_chatbot/
 │       └── script.js             # Fetch logic, session ID, doc upload chips
 ├── nginx/
 │   └── nginx.conf                # Proxies /api/ → backend:8000
-├── config.yaml                   # Backend application behavior (strategy, eval mode, thresholds)
+├── initdb/
+│   └── 01_schema.sql             # Postgres schema (loaded by docker-entrypoint on first init)
+├── config.yaml                   # Backend application behavior (strategy, thresholds, judge model)
 ├── litellm_config.yaml           # Model routing config for LiteLLM
-├── logs/
-│   └── chat.log                  # Per-message NDJSON
 ├── models/                       # HuggingFace model cache (local embedding provider)
 ├── docker-compose.yml
 ├── .env.example
@@ -90,13 +89,15 @@ docker compose up --build
 
 ### 3. Local dev (no Docker)
 ```bash
-# Start Redis (required for session memory)
-docker compose up redis -d
+# Start Redis (session memory) and Postgres (chat + eval data)
+docker compose up redis postgres -d
 
 # Backend
 cd backend
 pip install -r requirements.txt
-REDIS_URL=redis://localhost:6379 uvicorn app:app --reload --port 8000
+REDIS_URL=redis://localhost:6379 \
+POSTGRES_DSN=postgresql://chatbot:changeme@localhost:5432/chatbot \
+  uvicorn app:app --reload --port 8000
 
 # Frontend — open frontend/templates/index.html with VS Code Live Server
 # (script.js auto-detects Live Server and points API calls to localhost:8000)
@@ -152,6 +153,9 @@ Two-file split, by intent:
 | `REDIS_URL` | set by Docker | Redis connection string |
 | `LITELLM_BASE_URL` | set by Docker | LiteLLM proxy URL; unset to bypass and call OpenAI directly |
 | `EMBEDDING_MODEL_PATH` | `/app/models` | HuggingFace cache path inside the container (volume mount) |
+| `PG_USER` | `chatbot` | Postgres username (used by both the postgres service and the backend DSN) |
+| `PG_PASSWORD` | `changeme` | Postgres password |
+| `PG_DB` | `chatbot` | Postgres database name |
 
 ### `config.yaml`
 
@@ -181,9 +185,6 @@ rag:
 
 eval:
   judge_model: gpt-4o-mini            # LLM used for judging
-
-logging:
-  chat_log: logs/chat.log
 ```
 
 Reload behavior: backend reads `config.yaml` at startup. To apply changes, `docker compose restart backend`.
@@ -279,83 +280,81 @@ The model selector controls **which model answers the next message only**. Conve
 2. `docker compose restart backend`
 3. Takes effect immediately for new messages in all sessions — the system prompt is prepended at invocation time, not stored in Redis
 
-## Logs
+## Data storage
 
-`./logs/` is volume-mounted into the backend container and auto-created on first write.
-
-### `logs/chat.log` — one line per message, NDJSON
-
-```json
-{"timestamp": "2026-05-06T22:14:46+00:00", "session_id": "50bbe38e-...", "model": "gpt-4o-mini", "strategy": "smart", "temperature": 0.0, "question": "What was the first question?", "prompt_tokens": 37, "completion_tokens": 10, "session_tokens": 4521, "routing_intent": "position"}
-```
-
-| Field | Description |
-|---|---|
-| `timestamp` | UTC ISO-8601 |
-| `session_id` | Browser tab UUID — new UUID = new session |
-| `model` | Model name as sent by the frontend |
-| `strategy` | Active `history.strategy` |
-| `temperature` | Active `llm.temperature` |
-| `question` | The user's message |
-| `prompt_tokens` | Input tokens for this turn — key metric for strategy comparison |
-| `completion_tokens` | Output tokens for this turn |
-| `session_tokens` | Cumulative tokens for the session (running total, resets on restart) |
-| `routing_intent` | Router decision: `continuation`, `normal`, `position`, `topic_recall`, `semantic_recall` — only present for `smart` strategy |
-
-For verbose request-time inspection, run the backend with `docker compose logs -f backend` — uvicorn writes request/response info to stdout, which Docker captures.
-
-### Useful commands
+All chat traffic and evaluation results live in PostgreSQL (`postgres` service in docker-compose). Connect with any local GUI — pgAdmin, DBeaver, TablePlus, or `psql`:
 
 ```bash
-# Stream live chat log
-tail -f logs/chat.log
+# psql, from your host
+psql postgresql://chatbot:changeme@localhost:5432/chatbot
 
-# All turns for the smart strategy
-jq 'select(.strategy == "smart")' logs/chat.log
-
-# Routing intent breakdown for a session
-jq -r 'select(.routing_intent) | [.question, .routing_intent] | @tsv' logs/chat.log
-
-# Final session_tokens per session (last entry per session_id = total cost)
-jq -r '[.session_id, .strategy, .session_tokens] | @tsv' logs/chat.log | sort -u -k1,1
+# or from inside the postgres container
+docker compose exec postgres psql -U chatbot -d chatbot
 ```
 
-**Note on `prompt_tokens`:** This is the primary metric for comparing strategies. It shows exactly how much context each strategy injected per turn — the number varies by strategy while `completion_tokens` is roughly constant.
+The schema lives in [`initdb/01_schema.sql`](initdb/01_schema.sql) and is loaded on first DB init. Four tables:
+
+| Table | One row per | Purpose |
+|---|---|---|
+| `sessions` | chat session (UUID) | strategy, temperature, system prompt — constants for the session |
+| `turns` | chat message | question, response, tokens, routing decision, retrieved docs, context injected, and user-overridable ground truth (`intent_user_override`, `reference_answer`) |
+| `chunk_summaries` | summarizer-produced chunk | source messages + generated summary — only populated for `smart` strategy |
+| `eval_runs` | evaluation invocation | aggregate metrics + per-turn judge scores; one row per `eval.run --session` call |
+
+### Verbose container logs
+
+For request-time inspection, run `docker compose logs -f backend` — uvicorn writes request/response info to stdout, which Docker captures.
+
+### Useful SQL
+
+```sql
+-- All sessions, most recent first
+SELECT session_id, created_at, strategy, temperature FROM sessions ORDER BY created_at DESC;
+
+-- All turns for a session
+SELECT turn_number, model, question, response, routing->>'intent' AS intent
+FROM turns WHERE session_id = '50bbe38e-...' ORDER BY turn_number;
+
+-- Token totals per session (matches what chat.log used to show)
+SELECT session_id,
+       MAX((tokens->>'session_total')::int) AS total_tokens,
+       COUNT(*) AS turns
+FROM turns GROUP BY session_id;
+
+-- Routing intent breakdown for one session
+SELECT turn_number, question, routing->>'intent' AS intent FROM turns
+WHERE session_id = '50bbe38e-...' ORDER BY turn_number;
+
+-- Most recent eval run for a session
+SELECT evaluated_at, judge_model, aggregate_metrics
+FROM eval_runs WHERE session_id = '50bbe38e-...'
+ORDER BY evaluated_at DESC LIMIT 1;
+```
+
+### Manual labels and references
+
+Two columns on `turns` accept user-provided ground truth (durable across eval runs):
+
+```sql
+-- Override an LLM-judge intent label (takes precedence over judge_model output)
+UPDATE turns SET intent_user_override = 'semantic_recall'
+WHERE session_id = '50bbe38e-...' AND turn_number = 7;
+
+-- Set a gold reference answer for E2E correctness judging
+UPDATE turns SET reference_answer = 'The first topic was prompt engineering.'
+WHERE session_id = '50bbe38e-...' AND turn_number = 11;
+```
+
+Re-run `eval.run --session <uuid>` after editing — the overrides take effect immediately without re-querying the LLM judge.
 
 
 ## Test prompt set
 
-Settings used (in `config.yaml`): `history.max_tokens=1000`, `history.summarize_after=3`, `history.rag_top_k=4`, `history.window_size=6`, `history.chunk_size=6`, `history.topic_similarity_threshold=0.65`, `llm.temperature=0.0`
-
-**Expected intent** labels are for supervised router accuracy evaluation. They represent semantic intent of the query, independent of `WINDOW_SIZE` or other config. A mismatch between expected and actual intent is a router bug; whether that bug causes an end-to-end failure depends on whether chunk summaries or the window cover the gap.
-
-| # | Prompt | Expected intent | Assessment |
-|---|---|---|---|
-| 1 | Who are you? | `continuation` | Baseline: system prompt injection + model persona. Short query (<4 words) heuristic fires correctly. |
-| 2 | What is prompt engineering? | `normal` | Topic anchor — referenced by #5, #6, #7. First substantive query, no recall signal. |
-| 3 | Is PE important? | `continuation` | Short follow-up. Tests 1-turn memory. |
-| 4 | What other skills? | `continuation` | Short follow-up. For `summarize`: SUMMARIZE_AFTER=3 means first summarization fires after turn #2's response (4 messages > 3); by turn #4 two summarization cycles have already run. |
-| 5 | PE becoming less important / context engineering? | `normal` | Reasoning test. Self-contained enough that most strategies answer correctly regardless of window — tests reasoning quality, not recall. |
-| 6 | Provide PE techniques examples. | `normal` | By turn #6, WINDOW_SIZE=6 excludes turn #2 (PE definition). `full` succeeds; `smart`/`rag` must retrieve. With chunk summaries, `normal` succeeds too. |
-| 7 | Combine the skills you listed when I asked 'What other skills?' with the PE techniques you described into a 3-step roadmap. | `semantic_recall` | **Router under-classifies to `normal`** — phrasing "you listed", "I asked", "you described" not in recall patterns. Tests cross-strategy memory: summary fidelity (`summarize`) vs. vector recall (`rag`) vs. chunk summary coverage (`smart`). |
-| 8 | What was the first question? | `position` | Positional retrieval. Router correctly matches "first question" pattern. |
-| 9 | My favorite language is Python. | `normal` | Fact injection. Binary test: does recall in #10 and #13 succeed? |
-| 10 | What is my favorite language? | `semantic_recall` | **Router under-classifies to `normal`** — no recall trigger words. Works while Python info is in window; fails outside it. Semantic label is recall. |
-| 11 | What was the first topic we discussed? | `position` | After router fix: "first topic" pattern added. Resolver returns first 2 exchanges (not just first message) so model can infer topic from context. |
-| 12 | Summarize what we've covered so far. | `semantic_recall` | **Router under-classifies to `normal`** — "we've covered" contraction bypasses regex. With chunk summaries injected by `normal` path, the answer is now correct despite wrong intent. |
-| 13 | Earlier I told you my favorite language — what did you say it was? | `semantic_recall` | "Earlier I" matches recall pattern correctly. Hallucination probe: model must retrieve actual stated language, not fabricate. |
-| 14 | What was my last question? | `position` | Tests "last" variant of positional resolver. |
-| 15 | What was my 3rd question? | `position` | Tests ordinal variant of positional resolver. |
-| 16 | Going back to prompt engineering — give me one more technique. | `topic_recall` | Tests topic-bounded FAISS retrieval. Requires "prompt engineering" to have formed a topic cluster by this point. |
-| 17 | Remember when I told you my favorite language? | `semantic_recall` | Tests "remember when" trigger explicitly. |
-| 18 | Tell me about the weather today. | `normal` | **Negative test** — irrelevant query with no recall signal. Router must not false-positive into a recall path. |
-
-Router accuracy = correct_intent / 18. Current accuracy in the CLI (no `available_topics` passed): **14/18**. See the **Evaluation > Router known under-classifications** section below for the full failure list.
-
-
 ## Evaluation
 
-The `eval/` module measures the quality of each chat-memory component (router, summarizer, retrieval) and the end-to-end response against a fixed labeled test set in `eval/dataset.py`. All eval runs **inside the backend container** so the environment, LLM config, embeddings, and dependencies match production exactly.
+Evaluation measures the quality of each chat-memory component (router, summarizer, retrieval) and the end-to-end response on **live chat traffic** stored in Postgres. The CLI is invoked with a `session_id` and reads everything it needs from the `turns`, `chunk_summaries`, and (after the run) `eval_runs` tables.
+
+There is no hardcoded benchmark dataset — the project's goal is collaborative improvement of evaluation, and a maintainer-curated baseline would bias the system toward author assumptions. If you want a reproducible baseline, follow the [Suggested baseline prompts](#suggested-baseline-prompts-optional) below; they are *suggestions*, not requirements.
 
 ### Mental model: same shape as supervised ML
 
@@ -365,62 +364,85 @@ Standard supervised learning measures a model by comparing predictions to labels
 metric = f(y_true, y_pred)
 ```
 
-Our setup uses the same shape. For the router, `y_true` is a hardcoded intent label in `dataset.py`. For the other components, real ground truth doesn't exist — we synthesize it using a stronger LLM at evaluation time (the "LLM-as-a-judge" pattern).
+Our setup uses the same shape. For the router, real users ask arbitrary queries — there are no pre-labeled `y_true` values. So we synthesize ground truth using a stronger LLM at evaluation time ("LLM-as-a-judge"). For other components there's no fixed ground truth either; the judge provides it.
 
-| Component | `y_pred` | `y_true` (ground truth) | Metric |
+| Component | `y_pred` (recorded during chat) | `y_true` (ground truth at eval time) | Metric |
 |---|---|---|---|
-| **Router** | Heuristic router's intent | Hardcoded label in `dataset.py` | Accuracy, per-class F1, confusion matrix |
-| **Retrieval** | Top-K retrieved docs | LLM judge marks each doc as relevant/not | Context Precision, Context Recall |
-| **Summarizer** | Generated chunk summary | (a) source messages themselves (lexical) (b) LLM judge (semantic) | ROUGE-L, Faithfulness (1-5) |
-| **E2E** | The model's response on a labeled prompt | LLM judge scores 1-5 per dimension, against the reference answer | Correctness, Coherence, Groundedness |
+| **Router** | Heuristic router's intent (`turns.routing.intent`) | LLM judge labels each query, falling back to `turns.intent_user_override` if the user has set one | Accuracy, per-class F1, confusion matrix |
+| **Retrieval** | Top-K retrieved docs (`turns.retrieved`) | LLM judge marks each doc as relevant/not | Context Precision, Context Recall |
+| **Summarizer** | Generated chunk summary (`chunk_summaries.summary_text`) | (a) source messages themselves (lexical) (b) LLM judge (semantic) | ROUGE-L, Faithfulness (1-5) |
+| **E2E** | The model's response (`turns.response`) | LLM judge scores 1-5 per dimension, using `turns.reference_answer` if set | Correctness, Coherence, Groundedness |
 
 ### Running it
 
-```bash
-# Backend must be running. Then in another terminal:
+The backend must be up (`docker compose up`). In another terminal, with a session UUID from the browser:
 
-docker compose exec backend python -m eval.run                  # router (no API calls — pure supervised)
-docker compose exec backend python -m eval.run -c summarizer    # ROUGE-L + LLM faithfulness
-docker compose exec backend python -m eval.run -c retrieval     # context precision + recall via LLM judge
-docker compose exec backend python -m eval.run -c e2e           # LLM-as-a-judge usage instructions
-docker compose exec backend python -m eval.run -c all           # router + summarizer + retrieval
+```bash
+docker compose exec backend python -m eval.run --session <uuid>                  # all components
+docker compose exec backend python -m eval.run --session <uuid> -c router
+docker compose exec backend python -m eval.run --session <uuid> -c retrieval
+docker compose exec backend python -m eval.run --session <uuid> -c summarizer
+docker compose exec backend python -m eval.run --session <uuid> -c e2e
 ```
 
-The CLI prints metrics to stdout. Pipe to a file if you want to save: `... > my_report.txt`.
+Each invocation:
+1. Fetches the session's turns + chunk summaries from Postgres
+2. For router eval: LLM-judges each unlabeled turn's intent (cached back to `turns.intent_judge_label` so re-runs don't re-pay)
+3. Runs the appropriate judges (retrieval relevance, summarizer faithfulness, e2e correctness/coherence/groundedness)
+4. Prints aggregate metrics + per-turn breakdown to stdout
+5. Appends an `eval_runs` row for historical comparison
 
-### Router known under-classifications (current accuracy: 14/18)
+### Suggested baseline prompts (optional)
 
-Four cases where the heuristic router's prediction differs from the expected intent:
+A set of 18 prompts I (the author) have been using to probe each chat-memory pattern. They're suggestions, not part of the codebase — you (or another contributor) can refine them, replace them, or design your own. If you want a reproducible baseline across changes, type these into the chat UI in order, then run `eval.run --session <uuid>` against the resulting session.
 
-| # | Prompt | Expected | Predicted | Why |
-|---|---|---|---|---|
-| 7 | "Combine the skills you listed when I asked..." | `semantic_recall` | `normal` | Phrasing "you listed / I asked / you described" not in recall patterns |
-| 10 | "What is my favorite language?" | `semantic_recall` | `normal` | No recall trigger words |
-| 12 | "Summarize what we've covered so far." | `semantic_recall` | `normal` | `"we've"` contraction bypasses the `we (covered)` regex |
-| 16 | "Going back to prompt engineering..." | `topic_recall` | `semantic_recall` | No topic cluster exists in CLI eval (matches `going back to` recall pattern instead). In a live session, `TopicClusterer` would expose "prompt engineering" as a known topic and this case would classify correctly. |
+After chatting, optionally set `intent_user_override` via SQL on any turn where you disagree with the LLM judge's intent label (see [Manual labels and references](#manual-labels-and-references)).
 
-End-to-end answer quality may still be acceptable when chunk summaries cover the gap. The CLI calls `evaluate_router()` without `available_topics` to match a fresh-session baseline; pass `available_topics=[...]` programmatically to simulate a session where topics have already been clustered.
+| # | Prompt | Suggested intent | Notes |
+|---|---|---|---|
+| 1 | Who are you? | `continuation` | Short query (<4 words) heuristic. |
+| 2 | What is prompt engineering? | `normal` | First substantive query; no recall signal. |
+| 3 | Is PE important? | `continuation` | Short follow-up. |
+| 4 | What other skills? | `continuation` | Short follow-up. |
+| 5 | Is PE becoming less important as context engineering matures? | `normal` | Reasoning test; self-contained. |
+| 6 | Provide PE techniques examples. | `normal` | By turn #6, `window_size=6` excludes turn #2 — `full` succeeds, `smart`/`rag` must retrieve. |
+| 7 | Combine the skills you listed when I asked 'What other skills?' with the PE techniques you described into a 3-step roadmap. | `semantic_recall` | Router currently under-classifies to `normal` — phrasing not in recall patterns. |
+| 8 | What was the first question? | `position` | Tests positional retrieval. |
+| 9 | My favorite language is Python. | `normal` | Fact injection — recall test in #10, #13. |
+| 10 | What is my favorite language? | `semantic_recall` | Router currently under-classifies to `normal` — no recall trigger words. |
+| 11 | What was the first topic we discussed? | `position` | Tests "first topic" pattern. |
+| 12 | Summarize what we've covered so far. | `semantic_recall` | Router currently under-classifies — `"we've"` contraction bypasses regex. |
+| 13 | Earlier I told you my favorite language — what did you say it was? | `semantic_recall` | Hallucination probe; recall pattern matches correctly. |
+| 14 | What was my last question? | `position` | Tests "last" variant of positional resolver. |
+| 15 | What was my 3rd question? | `position` | Tests ordinal variant. |
+| 16 | Going back to prompt engineering — give me one more technique. | `topic_recall` | Requires "prompt engineering" to have formed a topic cluster. |
+| 17 | Remember when I told you my favorite language? | `semantic_recall` | Tests "remember when" trigger explicitly. |
+| 18 | Tell me about the weather today. | `normal` | Negative test — router must not false-positive into a recall path. |
+
+After running these and triggering `eval.run --session <uuid>`, you'd expect the router to under-classify intents at turns #7, #10, #12 (known limitations — see TODO).
 
 ### Programmatic usage
 
-```python
-# Router — sync, against hardcoded labels
-from eval import evaluate_router
-report = evaluate_router()                                 # baseline (no topic cluster)
-# report = evaluate_router(available_topics=["prompt engineering"])  # with known topic
+The component evaluators are pure functions and can be called from your own scripts. The CLI in `eval/run.py` is one consumer; you can build others (e.g., a cross-strategy comparison script).
 
-# Summarizer — async, generates summaries on a conversation then evaluates
-from eval import evaluate_live
-report = await evaluate_live(llm, messages, chunk_size=6, window_size=6)
+```python
+from eval import evaluate_router, evaluate_retrieval, evaluate_responses, evaluate_summarizer
+from eval.router_eval import RouterCase
+from chat_history.router import Intent
+
+# Router — sync, requires labeled cases
+cases = [RouterCase(id=1, prompt="What is X?", expected_intent=Intent.NORMAL)]
+report = evaluate_router(cases=cases)
+
+# Summarizer — async, takes (source_messages, generated_summary) pairs
+report = await evaluate_summarizer(llm, [(messages, summary_text), ...])
 
 # Retrieval — async, LLM judges per-doc relevance
-from eval import evaluate_retrieval
 report = await evaluate_retrieval(llm, [
     {"query": "...", "retrieved": [doc1, doc2], "all_docs": full_pool},
 ])
 
 # E2E — async, LLM-as-a-judge
-from eval import evaluate_responses
 report = await evaluate_responses(llm, [
     {"question": "...", "response": "...", "reference": "...", "context": "..."},
 ])
@@ -431,17 +453,15 @@ report = await evaluate_responses(llm, [
 
 1. Fix router under-classifications: extend recall patterns for implicit references ("you listed", "I asked") and contractions ("we've covered")
 2. Replace router regex with embedding-based intent matcher or LLM classifier
-3. Implement `REASONING_STRATEGY` env var (chain-of-thought, reflexion, extended thinking)
+3. Implement reasoning strategy variants (chain-of-thought, reflexion, extended thinking)
 4. Graph memory (knowledge graph as a memory layer alongside FAISS)
-5. Run E2E eval across all 5 strategies on the 18-prompt test set and compare
+5. Cross-strategy comparison script that runs the suggested baseline prompts against each `history.strategy` and compares the resulting `eval_runs` rows
 
 
 ## What to experiment with next
 
-- **Streaming responses** — `stream=True` in `ChatOpenAI` + SSE on frontend
-- **System prompt editor** — UI textarea to change the prompt without restarting
 - **Tool calling** — `@tool` decorated functions + `ToolNode` in LangGraph graph
-- **Document summarization on upload** — generate a document-level summary at upload time alongside chunk indexing; route "what is this doc about?" queries to the summary instead of chunks
+- **Reasoning logic** -- implement resoning logic and metrics that would help evaluation of it
 
 
 ## Useful links

@@ -73,7 +73,10 @@ async def evaluate_retrieval(
             )
             total_relevant = sum(all_relevance)
             if total_relevant == 0:
-                recall = 1.0  # nothing relevant to miss
+                # No relevant docs in the pool — recall is undefined.
+                # Return None so this sample is excluded from the mean rather
+                # than silently inflating it with a vacuous 1.0.
+                recall = None
             else:
                 retrieved_contents = {d.page_content for d in retrieved}
                 retrieved_relevant = sum(

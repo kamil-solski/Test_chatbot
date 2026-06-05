@@ -11,7 +11,9 @@ class SessionRAGStore:
     def __init__(self) -> None:
         self._embeddings = get_embeddings()
         self._stores: dict[str, FAISS] = {}
-        self._indexed: dict[str, set] = {}  # session_id -> set of indexed message ids
+        # Dedup by (role, content) tuple — msg.id is None for HumanMessage/AIMessage
+        # constructed without an explicit ID, which is the common case.
+        self._indexed: dict[str, set[tuple[str, str]]] = {}
 
     def index_messages(self, session_id: str, messages: list[BaseMessage]) -> None:
         """Embed and store any messages not yet indexed for this session."""
@@ -19,15 +21,17 @@ class SessionRAGStore:
         new_docs: list[Document] = []
 
         for msg in messages:
-            msg_id = msg.id
-            if msg_id in indexed or not isinstance(msg.content, str) or not msg.content.strip():
+            if not isinstance(msg.content, str) or not msg.content.strip():
                 continue
             role = type(msg).__name__.replace("Message", "").lower()
+            key = (role, msg.content)
+            if key in indexed:
+                continue
             new_docs.append(Document(
                 page_content=msg.content,
-                metadata={"role": role, "message_id": msg_id},
+                metadata={"role": role, "message_id": msg.id},
             ))
-            indexed.add(msg_id)
+            indexed.add(key)
 
         if not new_docs:
             return

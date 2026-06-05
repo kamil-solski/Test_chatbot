@@ -25,6 +25,10 @@ ANTHROPIC_API_KEY: str | None = os.getenv("ANTHROPIC_API_KEY")
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
 LITELLM_BASE_URL: str | None = os.getenv("LITELLM_BASE_URL") or None
 EMBEDDING_MODEL_PATH: str = os.getenv("EMBEDDING_MODEL_PATH", "/app/models")
+POSTGRES_DSN: str = os.getenv(
+    "POSTGRES_DSN",
+    "postgresql://chatbot:changeme@localhost:5432/chatbot",
+)
 
 
 # --------------------------------------------------------------------------- #
